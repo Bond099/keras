@@ -82,6 +82,10 @@ class Dense(Layer):
         kernel_constraint=None,
         bias_constraint=None,
         lora_rank=None,
+        vblora_rank=None,  # New parameter
+        vblora_num_vectors=None,  # New parameter
+        vblora_vector_length=None,  # New parameter
+        vblora_topk=None,
         **kwargs,
     ):
         super().__init__(activity_regularizer=activity_regularizer, **kwargs)
@@ -96,6 +100,11 @@ class Dense(Layer):
         self.bias_constraint = constraints.get(bias_constraint)
         self.lora_rank = lora_rank
         self.lora_enabled = False
+        self.vblora_rank = vblora_rank
+        self.vblora_num_vectors = vblora_num_vectors
+        self.vblora_vector_length = vblora_vector_length
+        self.vblora_topk = vblora_topk
+        self.vblora_enabled = False
         self.input_spec = InputSpec(min_ndim=2)
         self.supports_masking = True
 
@@ -127,7 +136,35 @@ class Dense(Layer):
         self.built = True
         if self.lora_rank:
             self.enable_lora(self.lora_rank)
+            
+        if self.vblora_rank is not None:
+            self.enable_vblora(
+                self.vblora_rank,
+                self.vblora_num_vectors,
+                self.vblora_vector_length,
+                self.vblora_topk    )
+            
+            
+    def _compute_vblora_A(self):
+        top_k_logits, indices = ops.top_k(self.vblora_logits_A, k=self.topk, sorted=True)
+        topk_weights = ops.softmax(top_k_logits, axis=-1)
+        flat_indices = ops.reshape(indices, (-1,))
+        flat_selected = ops.gather(self.vblora_vector_bank, flat_indices, axis=0)
+        selected_vectors = ops.reshape(flat_selected, indices.shape + (self.vector_length,))
+        A = ops.sum(topk_weights[..., None] * selected_vectors, axis=-2)
+        in_tile = self.input_dim // self.vector_length
+        return ops.reshape(A, (self.rank, in_tile * self.vector_length))
 
+    def _compute_vblora_B(self):
+        top_k_logits, indices = ops.top_k(self.vblora_logits_B, k=self.topk, sorted=True)
+        topk_weights = ops.softmax(top_k_logits, axis=-1)
+        flat_indices = ops.reshape(indices, (-1,))
+        flat_selected = ops.gather(self.vblora_vector_bank, flat_indices, axis=0)
+        selected_vectors = ops.reshape(flat_selected, indices.shape + (self.vector_length,))
+        B = ops.sum(topk_weights[..., None] * selected_vectors, axis=-2)
+        B = ops.transpose(B, (0, 2, 1))
+        out_tile = self.output_dim // self.vector_length
+        return ops.reshape(B, (out_tile * self.vector_length, self.rank))
     @property
     def kernel(self):
         if not self.built:
@@ -138,6 +175,12 @@ class Dense(Layer):
             return self._kernel + ops.matmul(
                 self.lora_kernel_a, self.lora_kernel_b
             )
+        elif self.vblora_enabled:
+            A = self._compute_vblora_A()
+            B = self._compute_vblora_B()
+            delta_kernel = ops.matmul(B, A)
+            return self._kernel + delta_kernel
+           
         return self._kernel
 
     def call(self, inputs, training=None):
@@ -147,6 +190,8 @@ class Dense(Layer):
         if self.activation is not None:
             x = self.activation(x)
         return x
+
+    
 
     def compute_output_shape(self, input_shape):
         output_shape = list(input_shape)
@@ -186,7 +231,7 @@ class Dense(Layer):
         self._kernel.trainable = False
         self._tracker.lock()
         self.lora_enabled = True
-        self.lora_rank = rank
+        self.lora_rank = rank    
 
     def save_own_variables(self, store):
         # Do nothing if the layer isn't yet built
@@ -241,6 +286,65 @@ class Dense(Layer):
         if self.lora_enabled:
             self.lora_kernel_a.assign(ops.zeros(self.lora_kernel_a.shape))
             self.lora_kernel_b.assign(ops.zeros(self.lora_kernel_b.shape))
+            
+    def enable_vblora(
+        self,
+        rank,
+        num_vectors,
+        vector_length,
+        topk,
+        vector_bank_bound=0.02,
+        logits_std=0.1,
+    ):
+        if self.kernel_constraint:
+            raise ValueError(
+                "VBLoRA is incompatible with kernel constraints. "
+                "Remove the `kernel_constraint` argument to enable VBLoRA."
+            )
+        if not self.built:
+            raise ValueError("Cannot enable VBLoRA on a layer that isn't yet built.")
+        if self.lora_enabled:
+            raise ValueError("Cannot enable VBLoRA when LoRA is already enabled.")
+        if self.vblora_enabled:
+            raise ValueError("VBLoRA is already enabled. This can only be done once per layer.")
+
+        in_features = self._kernel.shape[0]
+        out_features = self.units
+        if in_features % vector_length != 0 or out_features % vector_length != 0:
+            raise ValueError(
+                f"in_features ({in_features}) and out_features ({out_features}) "
+                f"must be divisible by vector_length ({vector_length})"
+            )
+
+        vector_bank_initializer = initializers.RandomUniform(minval=-vector_bank_bound, maxval=vector_bank_bound)
+        logits_initializer = initializers.RandomNormal(stddev=logits_std)
+
+        self._tracker.unlock()
+        self.vblora_vector_bank = self.add_weight(
+            name="vblora_vector_bank",
+            shape=(num_vectors, vector_length),
+            initializer=vector_bank_initializer,
+            trainable=True,
+        )
+        self.vblora_logits_A = self.add_weight(
+            name="vblora_logits_A",
+            shape=(rank, in_features // vector_length, num_vectors),
+            initializer=logits_initializer,
+            trainable=True,
+        )
+        self.vblora_logits_B = self.add_weight(
+            name="vblora_logits_B",
+            shape=(out_features // vector_length, rank, num_vectors),
+            initializer=logits_initializer,
+            trainable=True,
+        )
+        self._kernel.trainable = False
+        self._tracker.lock()
+        self.vblora_enabled = True
+        self.rank = rank
+        self.num_vectors = num_vectors
+        self.vector_length = vector_length
+        self.topk = topk        
 
     def get_config(self):
         base_config = super().get_config()
@@ -261,7 +365,13 @@ class Dense(Layer):
         }
         if self.lora_rank:
             config["lora_rank"] = self.lora_rank
-        return {**base_config, **config}
+        
+        if self.vblora_enabled:
+            config["vblora_rank"] = self.rank
+            config["vblora_num_vectors"] = self.num_vectors
+            config["vblora_vector_length"] = self.vector_length
+            config["vblora_topk"] = self.topk
+        return {**base_config, **config} 
 
     def _check_load_own_variables(self, store):
         all_vars = self._trainable_variables + self._non_trainable_variables
@@ -296,7 +406,7 @@ class Dense(Layer):
                 f"{len(store.keys())} variables during loading. "
                 f"Expected: {[v.name for v in all_vars]}"
             )
-
+    
     # Quantization-related (int8 and float8) methods
 
     def quantized_build(self, input_shape, mode):
